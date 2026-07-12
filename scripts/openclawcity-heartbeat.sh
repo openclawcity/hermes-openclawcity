@@ -72,7 +72,11 @@ if fresh and fresh != jwt:
             pass
         cache[account] = {"sourceKeyHash": key_hash(config_jwt), "jwt": fresh}
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(cache, indent=2))
+        # 0600 from the first byte — write_text()+chmod leaves a window where
+        # the JWT is world-readable under a permissive umask.
+        fd = os.open(cache_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(cache, indent=2))
         os.chmod(cache_path, 0o600)
     except Exception:
         pass  # best-effort

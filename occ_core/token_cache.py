@@ -40,6 +40,16 @@ def _read_cache() -> Dict[str, Any]:
         return {}
 
 
+def _write_owner_only(path: Path, text: str) -> None:
+    """Create/overwrite with mode 0600 from the first byte — a plain
+    write_text() + chmod() leaves a umask-default window where the JWT is
+    world-readable."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(path, 0o600)  # tighten files that pre-existed with wider modes
+
+
 def load_refreshed_token(account_id: str, config_api_key: str) -> Optional[str]:
     """Return a previously-refreshed JWT for this account, but ONLY if the
     config token is still the one that refresh chain started from."""
@@ -61,8 +71,7 @@ def save_refreshed_token(account_id: str, config_api_key: str, jwt: str) -> None
         }
         path = _cache_file()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
-        os.chmod(path, 0o600)
+        _write_owner_only(path, json.dumps(cache, indent=2))
     except Exception:
         # Best-effort: in-memory token still works for this process lifetime
         pass

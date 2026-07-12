@@ -17,12 +17,19 @@ def _nullish(value: Any, fallback: Any) -> Any:
     return fallback if value is None else value
 
 
+def _as_dict(value: Any) -> Dict[str, Any]:
+    """Tolerate junk frames the way TS property access does: reading a field
+    off a non-object yields undefined in TS, so a non-dict here becomes {}
+    instead of raising AttributeError mid-dispatch."""
+    return value if isinstance(value, dict) else {}
+
+
 def format_event_text(event: Dict[str, Any]) -> str:
     """Format a city event into human-readable text for the LLM."""
-    frm = event.get("from")
-    name = _nullish(frm.get("name") if frm else None, "Unknown")
+    frm = _as_dict(event.get("from"))
+    name = _nullish(frm.get("name"), "Unknown")
     text = _nullish(event.get("text"), "")
-    md: Dict[str, Any] = event.get("metadata") or {}
+    md: Dict[str, Any] = _as_dict(event.get("metadata"))
     event_type = event.get("eventType", "")
 
     if event_type == "dm_request":
@@ -66,20 +73,26 @@ def format_event_text(event: Dict[str, Any]) -> str:
 
 def format_welcome_text(welcome: Dict[str, Any]) -> str:
     """Format a welcome frame into human-readable text."""
-    location = welcome.get("location") or {}
+    location = _as_dict(welcome.get("location"))
     zone = _nullish(location.get("zoneName"), f"Zone {_nullish(location.get('zoneId'), '?')}")
     building = f" in {location['buildingName']}" if location.get("buildingName") else ""
 
     nearby: List[Dict[str, Any]] = _nullish(
         welcome.get("nearby_bots"), _nullish(welcome.get("nearby"), [])
     )
-    nearby_names = [b.get("name") for b in nearby]
+    if not isinstance(nearby, list):
+        nearby = []
+    # TS Array.join renders undefined names as '' (and stringifies the rest)
+    # — mirror that rather than crash str.join on None / non-strings.
+    nearby_names = [str(_nullish(_as_dict(b).get("name"), "")) for b in nearby]
     if nearby_names:
         nearby_text = f" {len(nearby_names)} bots nearby: {', '.join(nearby_names)}."
     else:
         nearby_text = " No bots nearby."
 
     pending = _nullish(welcome.get("pending"), [])
+    if not isinstance(pending, (list, tuple)):
+        pending = []
     pending_text = f" You have {len(pending)} pending event(s)." if pending else ""
 
     return (
@@ -90,7 +103,7 @@ def format_welcome_text(welcome: Dict[str, Any]) -> str:
 
 def normalize(event: Dict[str, Any]) -> MessageEnvelope:
     """Normalize a city_event frame into a MessageEnvelope."""
-    frm = event.get("from") or {}
+    frm = _as_dict(event.get("from"))
     timestamp = event.get("timestamp")
     if timestamp is None:
         timestamp = int(time.time() * 1000)
@@ -99,7 +112,7 @@ def normalize(event: Dict[str, Any]) -> MessageEnvelope:
         "eventType": event.get("eventType"),
         "seq": event.get("seq"),
     }
-    metadata.update(event.get("metadata") or {})
+    metadata.update(_as_dict(event.get("metadata")))
 
     return MessageEnvelope(
         id=f"occ-{event.get('seq')}",

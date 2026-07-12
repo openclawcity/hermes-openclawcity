@@ -49,8 +49,16 @@ CITY_CONTEXT_MAX_CHARS = 8000
 # the same conversation within this window. See context_dedup.py.
 CONTEXT_REINJECT_WINDOW_MS = 60 * 1000  # 60 seconds
 
+# The city gateway rejects speak messages longer than this (server-side cap
+# in POST /world/action + /world/speak: 'Message too long (max 500 chars)').
+SPEAK_MAX_CHARS = 500
+
 # Soft cap on remembered reply routes (oldest-inserted evicted first).
 MAX_REMEMBERED_ROUTES = 1000
+# Soft cap on per-(account, peer) context-injection records. Each record
+# holds a full snapshot string (up to 8KB); without a cap a long-lived
+# process talking to many peers grows this unbounded.
+MAX_CONTEXT_ENTRIES = 1000
 
 TRUNCATION_SUFFIX = "\n…[city context truncated: run a heartbeat for the full picture]"
 
@@ -134,6 +142,10 @@ def plan_city_reply(route: CityRoute, raw_text: str) -> Optional[Dict[str, Any]]
             "message": text,
             "conversation_id": route.conversation_id,
         }
+    # Public speech is hard-capped by the gateway; truncate rather than have
+    # the whole reply rejected with a 400 (matches channel.ts planCityReply).
+    if len(text) > SPEAK_MAX_CHARS:
+        text = text[: SPEAK_MAX_CHARS - 1] + "…"
     return {"type": "agent_reply", "action": "speak", "text": text}
 
 
@@ -194,11 +206,13 @@ class CityChannelCore:
         city_context_max_chars: int = CITY_CONTEXT_MAX_CHARS,
         context_reinject_window_ms: int = CONTEXT_REINJECT_WINDOW_MS,
         max_remembered_routes: int = MAX_REMEMBERED_ROUTES,
+        max_context_entries: int = MAX_CONTEXT_ENTRIES,
         now_ms: Callable[[], int] = _now_ms,
     ) -> None:
         self.account_id = account_id
         self._window_ms = context_reinject_window_ms
         self._max_routes = max_remembered_routes
+        self._max_context = max_context_entries
         self._now_ms = now_ms
         self._heartbeat = (
             HeartbeatCache(
@@ -229,6 +243,11 @@ class CityChannelCore:
                     self._context_state, dedup_key, ctx, self._now_ms(), self._window_ms
                 ):
                     envelope.text = prepend_city_context(envelope.text, ctx)
+                # Bound the dedup state: each record holds a full snapshot
+                # string, so many distinct peers would otherwise grow this
+                # unbounded (oldest-inserted evicted first).
+                if len(self._context_state) > self._max_context:
+                    del self._context_state[next(iter(self._context_state))]
 
         platform_id, route = resolve_city_route(envelope)
         self._remember_route(platform_id, route)

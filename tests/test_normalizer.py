@@ -247,3 +247,65 @@ def test_preserves_extra_metadata_fields():
 def test_id_uses_event_seq_not_a_counter():
     assert normalize(make_event(seq=100)).id == "occ-100"
     assert normalize(make_event(seq=200)).id == "occ-200"
+
+
+# ── Fuzz: junk frames must degrade like TS optional chaining, never raise ──
+
+
+JUNK_EVENTS = [
+    {},
+    {"type": "city_event"},
+    {"from": "not-a-dict", "metadata": [1, 2, 3]},
+    {"from": 42, "text": 123, "seq": "abc"},
+    {"eventType": "chat_mention", "metadata": "zone-as-string"},
+    {"eventType": "proposal_received", "from": [], "metadata": ()},
+    {"eventType": "dm_message", "from": {"name": 7}, "text": "☂🜲" * 50_000},
+    {"eventType": None, "from": None, "text": None, "metadata": None, "seq": None},
+    {"eventType": "artifact_reaction", "metadata": {"reaction": None, "artifactId": None}},
+]
+
+
+def test_normalize_never_raises_on_junk_frames():
+    for event in JUNK_EVENTS:
+        envelope = normalize(dict(event))
+        assert isinstance(envelope.text, str)
+        assert isinstance(envelope.metadata, dict)
+        assert envelope.channel_id == "openclawcity"
+
+
+def test_format_event_text_never_raises_on_junk_frames():
+    for event in JUNK_EVENTS:
+        assert isinstance(format_event_text(dict(event)), str)
+
+
+def test_junk_from_falls_back_to_unknown():
+    envelope = normalize({"eventType": "dm_message", "from": "junk", "text": "hi", "seq": 1})
+    assert envelope.sender_id == "unknown"
+    assert envelope.sender_name == "Unknown"
+    assert envelope.text == "[DM from Unknown] hi"
+
+
+def test_non_dict_metadata_is_ignored_not_merged():
+    envelope = normalize({"eventType": "dm_message", "metadata": [1, 2], "seq": 5, "text": "x"})
+    assert envelope.metadata["eventType"] == "dm_message"
+    assert envelope.metadata["seq"] == 5
+
+
+def test_format_welcome_text_tolerates_junk():
+    junk_welcomes = [
+        {"location": "junk", "nearby_bots": "junk", "pending": 5},
+        {"nearby": [{"name": None}, "junk", {"name": 5}, {}]},
+        {"location": {"zoneName": None, "zoneId": None}},
+        {},
+    ]
+    for welcome in junk_welcomes:
+        assert isinstance(format_welcome_text(dict(welcome)), str)
+
+
+def test_unicode_text_passes_through():
+    envelope = normalize(
+        {"eventType": "dm_message", "from": {"id": "u1", "name": "Ålice 🌆"},
+         "text": "héllo — こんにちは ‮", "seq": 9}
+    )
+    assert "héllo — こんにちは" in envelope.text
+    assert "Ålice 🌆" in envelope.text

@@ -66,14 +66,34 @@ class FakeConn:
 class FakeCityServer:
     """Minimal fake of the city gateway for driving the client."""
 
-    def __init__(self, respond_pong=True):
+    def __init__(self, respond_pong=True, reject_tokens=()):
         self.respond_pong = respond_pong
+        # Tokens rejected at the HTTP upgrade with 401, exactly like the
+        # production DO (validateJWTWithBlacklist fails -> 401 JSON body).
+        self.reject_tokens = set(reject_tokens)
+        self.rejected_upgrades = 0
         self.connections = asyncio.Queue()
         self._server = None
 
+    async def _process_request(self, connection, request):
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(request.path).query)
+        token = (query.get("token") or [""])[0]
+        if token in self.reject_tokens:
+            self.rejected_upgrades += 1
+            import http as _http
+
+            return connection.respond(
+                _http.HTTPStatus.UNAUTHORIZED, '{"error":"Invalid or expired token"}'
+            )
+        return None
+
     async def start(self):
         self._server = await websockets.serve(
-            self._handler, "127.0.0.1", 0, ping_interval=None
+            self._handler,
+            "127.0.0.1",
+            0,
+            ping_interval=None,
+            process_request=self._process_request,
         )
         port = self._server.sockets[0].getsockname()[1]
         self.gateway_url = f"ws://127.0.0.1:{port}/agent-channel"
@@ -577,3 +597,138 @@ def test_stops_cleanly_and_does_not_reconnect():
         await server.stop()
 
     run(main())
+
+
+# ── Upgrade-level auth rejection (what the production DO actually does) ──
+#
+# The real gateway never sends an auth_failed error frame: an invalid/expired
+# JWT is rejected at the HTTP upgrade with a 401 JSON response. The client
+# must treat that exactly like an auth_failed frame — one refresh attempt,
+# then reconnect with the fresh JWT or stop permanently.
+
+
+def test_upgrade_401_triggers_refresh_and_reconnect():
+    async def main():
+        refresh_calls = []
+
+        async def http_post_json(url, headers, body):
+            refresh_calls.append((url, headers))
+            return 200, {"jwt": "fresh-jwt"}
+
+        refreshed = []
+        stopped = []
+        server = await FakeCityServer(reject_tokens={"expired-token"}).start()
+        client = make_client(
+            server.gateway_url,
+            api_key="expired-token",
+            http_post_json=http_post_json,
+            on_token_refresh=refreshed.append,
+            on_permanent_stop=stopped.append,
+        )
+        async with running(server, client):
+            await wait_until(lambda: refreshed == ["fresh-jwt"])
+            assert refresh_calls[0][0].endswith("/agents/refresh")
+            assert refresh_calls[0][1]["Authorization"] == "Bearer expired-token"
+
+            # Reconnects with the fresh JWT and completes the welcome handshake
+            conn = await server.next_connection()
+            assert conn.query["token"] == "fresh-jwt"
+            assert conn.headers["Authorization"] == "Bearer fresh-jwt"
+            await conn.send_json(WELCOME)
+            await wait_until(lambda: client.state is ConnectionState.CONNECTED)
+            assert stopped == []
+            assert server.rejected_upgrades == 1
+
+    run(main())
+
+
+def test_upgrade_401_with_failed_refresh_stops_permanently():
+    async def main():
+        async def http_post_json(url, headers, body):
+            return 401, {"error": "Invalid or too-old token"}
+
+        stopped = []
+        server = await FakeCityServer(reject_tokens={"expired-token"}).start()
+        client = make_client(
+            server.gateway_url,
+            api_key="expired-token",
+            http_post_json=http_post_json,
+            on_permanent_stop=stopped.append,
+        )
+        async with running(server, client):
+            await wait_until(lambda: stopped == ["auth_failed"])
+            assert client.stopped is True
+            # No reconnect storm: the one rejected upgrade, then silence.
+            await asyncio.sleep(0.3)
+            assert server.rejected_upgrades == 1
+            assert server.connections.empty()
+
+    run(main())
+
+
+def test_upgrade_401_after_refresh_also_stops_permanently():
+    async def main():
+        async def http_post_json(url, headers, body):
+            return 200, {"jwt": "still-bad-jwt"}  # refresh "succeeds"…
+
+        stopped = []
+        # …but the gateway rejects the fresh token too (e.g. clock skew,
+        # revoked bot). The second 401 must stop the client, not loop.
+        server = await FakeCityServer(
+            reject_tokens={"expired-token", "still-bad-jwt"}
+        ).start()
+        client = make_client(
+            server.gateway_url,
+            api_key="expired-token",
+            http_post_json=http_post_json,
+            on_permanent_stop=stopped.append,
+        )
+        async with running(server, client):
+            await wait_until(lambda: stopped == ["auth_failed"])
+            assert client.stopped is True
+            await asyncio.sleep(0.3)
+            assert server.rejected_upgrades == 2  # initial + one retry, no storm
+
+    run(main())
+
+
+# ── Synthetic events must not regress the ack watermark ──
+
+
+def test_initiative_prompt_seq_minus_one_does_not_regress_watermark():
+    async def main():
+        server = await FakeCityServer().start()
+        client = make_client(server.gateway_url)
+        async with running(server, client):
+            conn = await server.next_connection()
+            await conn.send_json(WELCOME)
+            await conn.send_json(city_event(42))
+            assert await conn.next_frame() == {"type": "ack", "seq": 42}
+
+            # The production DO pushes initiative_prompt with seq=-1.
+            await conn.send_json(
+                city_event(-1, eventType="initiative_prompt",
+                           **{"from": {"id": "city", "name": "The City"}},
+                           text="What's unfinished?")
+            )
+            assert await conn.next_frame() == {"type": "ack", "seq": -1}
+            assert client.last_ack_seq == 42  # watermark preserved
+
+            # Resume still carries the real watermark
+            await conn.close()
+            conn2 = await server.next_connection()
+            assert conn2.query["lastAckSeq"] == "42"
+
+    run(main())
+
+
+# ── JWT never reaches the logs ──
+
+
+def test_redact_strips_token_from_log_text():
+    client = make_client("ws://localhost:9/none", api_key="secret-jwt-abc123")
+    msg = client._redact(
+        "connect failed: ws://localhost:9/none?token=secret-jwt-abc123&botId=b"
+    )
+    assert "secret-jwt-abc123" not in msg
+    assert "[REDACTED]" in msg

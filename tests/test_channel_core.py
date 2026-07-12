@@ -358,3 +358,53 @@ def test_chat_type_mapping():
         assert core.chat_type("unknown-peer") == "group"
 
     run(main())
+
+
+# ── Speak truncation (server hard-caps public speech at 500 chars) ──
+
+
+def test_speak_reply_truncated_to_server_cap():
+    from occ_core.channel import SPEAK_MAX_CHARS
+
+    long_text = "x" * 1200
+    reply = plan_city_reply(CityRoute(action="speak"), long_text)
+    assert reply is not None
+    assert len(reply["text"]) == SPEAK_MAX_CHARS
+    assert reply["text"].endswith("…")
+    assert reply["text"][: SPEAK_MAX_CHARS - 1] == "x" * (SPEAK_MAX_CHARS - 1)
+
+
+def test_speak_reply_at_cap_not_truncated():
+    from occ_core.channel import SPEAK_MAX_CHARS
+
+    text = "y" * SPEAK_MAX_CHARS
+    reply = plan_city_reply(CityRoute(action="speak"), text)
+    assert reply == {"type": "agent_reply", "action": "speak", "text": text}
+
+
+def test_owner_and_dm_replies_not_speak_truncated():
+    long_text = "z" * 1200
+    owner = plan_city_reply(CityRoute(action="owner_reply"), long_text)
+    assert owner is not None and owner["message"] == long_text
+    dm = plan_city_reply(CityRoute(action="dm_reply", conversation_id="c1"), long_text)
+    assert dm is not None and dm["message"] == long_text
+
+
+# ── Context-injection state is bounded ──
+
+
+def test_context_state_evicts_oldest_beyond_cap():
+    async def main():
+        fetch = fetch_returning("snapshot")
+        core = make_core(heartbeat_fetch=fetch, max_context_entries=5)
+        for i in range(12):
+            env = normalize(city_event(seq=i, **{"from": {"id": f"peer-{i}", "name": f"P{i}"}}))
+            await core.process_inbound(env)
+        # Bounded: never grows past the cap.
+        assert len(core._context_state) == 5
+        # The evicted (oldest) peer gets context injected again on return.
+        env = normalize(city_event(seq=99, **{"from": {"id": "peer-0", "name": "P0"}}))
+        await core.process_inbound(env)
+        assert env.text.startswith("[CITY CONTEXT]")
+
+    run(main())

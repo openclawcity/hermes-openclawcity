@@ -18,9 +18,12 @@ Protocol semantics preserved exactly:
   ±30% jitter, floor 100ms. `rate_limited` errors honour the server's
   retryAfter instead. Close code 4000 means the server replaced this
   connection with a newer one — never reconnect.
-- auth_failed / token_expired self-heals once via POST {rest}/agents/refresh
-  (accepts tokens up to 30 days expired); a second auth failure after a
-  refresh attempt stops the client permanently.
+- Auth failure self-heals once via POST {rest}/agents/refresh (accepts tokens
+  up to 30 days expired); a second auth failure after a refresh attempt stops
+  the client permanently. The production gateway rejects a bad/expired JWT at
+  the HTTP upgrade itself (401, no error frame), so the upgrade status code is
+  inspected too; `auth_failed`/`token_expired` error frames are also honoured
+  for older/other gateway builds.
 
 Only stdlib + `websockets` (imported lazily so the pure helpers stay
 importable without it).
@@ -268,7 +271,15 @@ class OpenClawCityClient:
             except TypeError:  # websockets < 13 uses extra_headers
                 ws = await websockets.connect(url, extra_headers=headers, **kwargs)
         except Exception as err:
-            self._log.error("Connection failed: %s", err)
+            # Never echo the JWT: some websockets exceptions include the full
+            # URL (which carries ?token=...).
+            self._log.error("Connection failed: %s", self._redact(str(err)))
+            # The production gateway rejects an invalid/expired JWT at the
+            # HTTP upgrade (401 JSON response) — it never gets far enough to
+            # send an auth_failed error frame. Route upgrade auth rejections
+            # into the same one-shot refresh self-heal.
+            if _upgrade_status(err) in (401, 403):
+                await self._handle_auth_failure("auth_failed")
             return
 
         self._ws = ws
@@ -321,7 +332,7 @@ class OpenClawCityClient:
                 else:
                     self._log.info("[OCC] Unknown frame type: %s", ftype)
         except Exception as err:
-            self._log.error("WebSocket error: %s", err)
+            self._log.error("WebSocket error: %s", self._redact(str(err)))
         finally:
             if ping_task is not None:
                 ping_task.cancel()
@@ -408,7 +419,11 @@ class OpenClawCityClient:
     async def _send_ack(self, seq: Any) -> None:
         # PostgREST may return bigint IDs as strings — coerce to number.
         seq_num = _seq_num(seq)
-        self._last_ack_seq = seq_num
+        # Synthetic events (initiative_prompt) arrive with seq=-1 and junk
+        # frames coerce to 0; the server ignores acks with seq <= 0, so never
+        # let them regress the resume watermark.
+        if seq_num > 0:
+            self._last_ack_seq = seq_num
         if self._ws is not None:
             with contextlib.suppress(Exception):
                 await self._ws.send(json.dumps({"type": "ack", "seq": seq_num}))
@@ -506,6 +521,15 @@ class OpenClawCityClient:
 
     # ── Internals ──
 
+    def _redact(self, text: str) -> str:
+        """Strip the JWT out of any text destined for logs (connect errors
+        can embed the full URL, which carries ?token=...)."""
+        if self._token and self._token in text:
+            text = text.replace(self._token, "[REDACTED]")
+        if self._cfg.api_key and self._cfg.api_key in text:
+            text = text.replace(self._cfg.api_key, "[REDACTED]")
+        return text
+
     def _spawn(self, coro: Awaitable[None]) -> None:
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
@@ -536,6 +560,18 @@ class OpenClawCityClient:
                     result = self._on_state_change(state)
                     if inspect.isawaitable(result):
                         self._spawn(result)
+
+
+def _upgrade_status(err: Exception) -> Optional[int]:
+    """HTTP status of a rejected WebSocket upgrade, if this exception carries
+    one. websockets >= 13 raises InvalidStatus with a .response; older
+    versions raise InvalidStatusCode with a .status_code."""
+    response = getattr(err, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return status
+    status = getattr(err, "status_code", None)
+    return status if isinstance(status, int) else None
 
 
 def _seq_num(seq: Any) -> int:
