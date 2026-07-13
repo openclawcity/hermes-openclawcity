@@ -39,6 +39,7 @@ try:  # loaded as a package (relative imports available)
     )
     from .occ_core.client import ClientConfig, OpenClawCityClient  # type: ignore
     from .occ_core.frames import ConnectionState, MessageEnvelope  # type: ignore
+    from .occ_core.identity import ensure_identity, load_identity, update_stored_jwt  # type: ignore
     from .occ_core.token_cache import load_refreshed_token, save_refreshed_token  # type: ignore
 except ImportError:  # loaded as a bare module from the plugin dir
     if str(_PLUGIN_DIR) not in sys.path:
@@ -52,6 +53,7 @@ except ImportError:  # loaded as a bare module from the plugin dir
     )
     from occ_core.client import ClientConfig, OpenClawCityClient
     from occ_core.frames import ConnectionState, MessageEnvelope
+    from occ_core.identity import ensure_identity, load_identity, update_stored_jwt
     from occ_core.token_cache import load_refreshed_token, save_refreshed_token
 
 # Hermes host imports. Available whenever Hermes loads the plugin; guarded so
@@ -163,9 +165,16 @@ if HERMES_AVAILABLE:
 
             self._config_jwt = _env_jwt() or str(extra.get("jwt") or extra.get("api_key") or "")
             self._bot_id = _env_bot_id() or str(extra.get("bot_id") or "")
+            self._display_name = _env("OPENBOTCITY_DISPLAY_NAME", "OPENCLAWCITY_DISPLAY_NAME") or str(
+                extra.get("display_name") or ""
+            )
             self._gateway_url = str(extra.get("gateway_url") or "") or _env_gateway_url()
             self._api_base = str(extra.get("api_url") or "") or _env_api_base(self._gateway_url)
             self._account_id = str(extra.get("account_id") or "") or _env_account_id()
+            # True once credentials came from bootstrap (self-register) rather
+            # than an operator-supplied env JWT — decides where a refreshed JWT
+            # is persisted (identity file vs the config-keyed token cache).
+            self._bootstrap = False
 
             ping_ms = _env("OPENBOTCITY_PING_INTERVAL_MS")
             self._ping_interval_ms = (
@@ -188,11 +197,32 @@ if HERMES_AVAILABLE:
         # ── Lifecycle ──
 
         async def connect(self) -> bool:
-            if not self._config_jwt or not self._bot_id:
-                logger.error(
-                    "OpenClawCity credentials missing (OPENBOTCITY_JWT / OPENBOTCITY_BOT_ID)"
+            # Channel-by-default: if the agent did not bring its own JWT, register
+            # (or recover) an identity over HTTP so `install the plugin` is the
+            # whole onboarding. Runs in a thread — ensure_identity is blocking.
+            if not (self._jwt and self._bot_id):
+                ident = await asyncio.to_thread(
+                    ensure_identity,
+                    self._api_base,
+                    self._account_id,
+                    self._display_name or None,
+                    self._config_jwt or None,
+                    self._bot_id or None,
                 )
-                return False
+                if not ident.ok:
+                    logger.error("OpenClawCity: cannot connect — %s", ident.error)
+                    return False
+                self._jwt = ident.jwt
+                self._bot_id = ident.bot_id
+                self._bootstrap = ident.source != "env"
+                if ident.first_time and ident.verification_code:
+                    logger.warning(
+                        "OpenClawCity: registered as '%s'. Tell your human to claim you "
+                        "— enter code %s at %s",
+                        ident.slug,
+                        ident.verification_code,
+                        ident.claim_url or "https://openclawcity.ai/verify",
+                    )
 
             cfg = ClientConfig(
                 api_key=self._jwt,
@@ -295,7 +325,12 @@ if HERMES_AVAILABLE:
 
         def _handle_token_refresh(self, jwt: str) -> None:
             self._jwt = jwt
-            save_refreshed_token(self._account_id, self._config_jwt, jwt)
+            if self._bootstrap:
+                # Bootstrap identities live in the identity file (keyed by
+                # account), not the config-token-hashed refresh cache.
+                update_stored_jwt(self._account_id, jwt)
+            else:
+                save_refreshed_token(self._account_id, self._config_jwt, jwt)
             logger.info("OpenClawCity JWT refreshed and persisted (account=%s)", self._account_id)
 
         # ── City-context snapshot (GET /world/heartbeat) ──
@@ -336,11 +371,16 @@ async def _standalone_send(
     force_document=False,
 ):
     extra = getattr(pconfig, "extra", None) or {}
-    config_jwt = _env_jwt() or str(extra.get("jwt") or "")
-    if not config_jwt:
-        return {"error": "OPENBOTCITY_JWT is not set"}
     account_id = _env_account_id()
-    jwt = load_refreshed_token(account_id, config_jwt) or config_jwt
+    config_jwt = _env_jwt() or str(extra.get("jwt") or "")
+    if config_jwt:
+        jwt = load_refreshed_token(account_id, config_jwt) or config_jwt
+    else:
+        # Bootstrap identity: the JWT lives in the identity file, not the env.
+        stored = load_identity(account_id) or {}
+        jwt = stored.get("jwt") or ""
+    if not jwt:
+        return {"error": "OpenClawCity JWT unavailable (no OPENBOTCITY_JWT and no stored identity)"}
     gateway_url = _env_gateway_url()
     api_base = _env_api_base(gateway_url)
 
@@ -367,34 +407,41 @@ async def _standalone_send(
 
 
 def check_requirements() -> bool:
+    # websockets is the only hard prerequisite — the JWT is acquired at connect
+    # time (bootstrap self-registers) if the agent did not bring its own.
     try:
         import websockets  # noqa: F401
     except ImportError:
         return False
-    return bool(_env_jwt() and _env_bot_id())
+    return True
 
 
 def validate_config(config) -> bool:
-    extra = getattr(config, "extra", None) or {}
-    jwt = _env_jwt() or extra.get("jwt") or extra.get("api_key")
-    bot_id = _env_bot_id() or extra.get("bot_id")
-    return bool(jwt and bot_id)
+    # Always valid: connect() either uses supplied creds, reuses the stored
+    # identity, or registers under OPENBOTCITY_DISPLAY_NAME. It fails loudly
+    # with a specific message only if none of those is possible.
+    return True
 
 
 def _env_enablement() -> Optional[Dict[str, Any]]:
-    """Seed PlatformConfig.extra from environment variables."""
-    jwt = _env_jwt()
-    bot_id = _env_bot_id()
-    if not (jwt and bot_id):
-        return None
+    """Seed PlatformConfig.extra so the platform auto-enables on install. Any
+    of {JWT+bot_id, a stored identity, DISPLAY_NAME} is enough for connect() to
+    obtain credentials; the seed carries whatever the environment provides."""
     gateway_url = _env_gateway_url()
     seed: Dict[str, Any] = {
-        "jwt": jwt,
-        "bot_id": bot_id,
         "gateway_url": gateway_url,
         "api_url": _env_api_base(gateway_url),
         "account_id": _env_account_id(),
     }
+    jwt = _env_jwt()
+    bot_id = _env_bot_id()
+    if jwt:
+        seed["jwt"] = jwt
+    if bot_id:
+        seed["bot_id"] = bot_id
+    display_name = _env("OPENBOTCITY_DISPLAY_NAME", "OPENCLAWCITY_DISPLAY_NAME")
+    if display_name:
+        seed["display_name"] = display_name
     deliver = _env("OPENBOTCITY_CRON_DELIVER") or OWNER_PLATFORM_ID
     seed["home_channel"] = {"chat_id": deliver, "name": "OpenClawCity owner inbox"}
     return seed
@@ -422,8 +469,10 @@ def register(ctx) -> None:
         adapter_factory=lambda cfg: OpenClawCityPlatformAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,
-        required_env=["OPENBOTCITY_JWT", "OPENBOTCITY_BOT_ID"],
-        install_hint="pip install websockets",
+        # Nothing is strictly required: connect() self-registers under
+        # OPENBOTCITY_DISPLAY_NAME (or reuses a stored / env identity).
+        required_env=[],
+        install_hint="pip install websockets  # then set OPENBOTCITY_DISPLAY_NAME to your city name",
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="OPENBOTCITY_CRON_DELIVER",
         standalone_sender_fn=_standalone_send,

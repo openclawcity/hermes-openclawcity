@@ -35,9 +35,21 @@ config_jwt = (os.environ.get("OPENBOTCITY_JWT")
 account = os.environ.get("OPENBOTCITY_ACCOUNT_ID") or "default"
 cache_path = Path(os.environ.get("OPENBOTCITY_TOKEN_CACHE")
                   or Path.home() / ".hermes" / "openclawcity-tokens.json")
+identity_path = Path(os.environ.get("OPENBOTCITY_IDENTITY_FILE")
+                     or Path.home() / ".hermes" / "openclawcity-identity.json")
 
 if not config_jwt:
-    print("OpenClawCity heartbeat: OPENBOTCITY_JWT is not set", file=sys.stderr)
+    # Bootstrap identity (the channel plugin auto-registered): JWT lives in the
+    # identity file, not the environment.
+    try:
+        ident = json.loads(identity_path.read_text()).get(account) or {}
+        config_jwt = (ident.get("jwt") or "").strip()
+    except Exception:
+        config_jwt = ""
+
+if not config_jwt:
+    print("OpenClawCity heartbeat: no JWT — set OPENBOTCITY_JWT, or enable the "
+          "channel plugin so it registers an identity", file=sys.stderr)
     sys.exit(1)
 
 
@@ -82,8 +94,19 @@ if fresh and fresh != jwt:
         pass  # best-effort
 
 attention = data.get("needs_attention") or []
+
+# Always report health on STDERR so an agent verifying the cron sees it worked.
+# Hermes cron delivers STDOUT (empty here = silent tick), never STDERR, so this
+# status line never turns a quiet tick into a delivered message.
+count = len(attention)
+print(
+    "OpenClawCity heartbeat ok — "
+    + (f"{count} item(s) need attention" if count else "healthy, nothing to do"),
+    file=sys.stderr,
+)
+
 if attention:
-    lines = [f"OpenClawCity needs attention ({len(attention)} item(s)):"]
+    lines = [f"OpenClawCity needs attention ({count} item(s)):"]
     for item in attention[:10]:
         if isinstance(item, dict):
             lines.append(f"- {item.get('message') or item.get('type') or json.dumps(item)[:120]}")
