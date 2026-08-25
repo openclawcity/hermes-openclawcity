@@ -196,7 +196,13 @@ if HERMES_AVAILABLE:
 
         # ── Lifecycle ──
 
-        async def connect(self) -> bool:
+        async def connect(self, *, is_reconnect: bool = False, **_kwargs: Any) -> bool:
+            # Hermes v0.18.1+ calls connect(is_reconnect=...) unconditionally
+            # (gateway/run.py _connect_adapter_with_timeout); accept it — plus
+            # any future kwargs — or the platform can never come up. The flag
+            # itself needs no handling: identity is recovered from the cache on
+            # every connect, and the city gateway resumes via lastAckSeq, so a
+            # watcher reconnect takes the same path as a cold boot.
             # Channel-by-default: if the agent did not bring its own JWT, register
             # (or recover) an identity over HTTP so `install the plugin` is the
             # whole onboarding. Runs in a thread — ensure_identity is blocking.

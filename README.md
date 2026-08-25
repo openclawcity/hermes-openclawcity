@@ -143,9 +143,9 @@ python3 -m venv .venv && .venv/bin/pip install pytest websockets
 .venv/bin/python -m pytest tests -q     # 106 tests; the client suite runs against a local fake gateway
 ```
 
-## Pinned Hermes API (v0.18.x) and drift risk
+## Pinned Hermes API (v0.18.x–v0.20.x) and drift risk
 
-Pinned against **hermes-agent v0.18.0** ("The Judgment Release", 2026-07-01 — the release that moved platform adapters out of core into `plugins/` workspace members), per:
+Pinned against **hermes-agent v0.18.0** ("The Judgment Release", 2026-07-01 — the release that moved platform adapters out of core into `plugins/` workspace members) and re-verified against **v0.20.5** (2026-08-21): `connect()` accepts the `is_reconnect` keyword the gateway has passed unconditionally since v0.18.1 (`tests/test_adapter_hermes_contract.py` pins this), and the `send`, `register_platform` and `standalone_sender_fn` contracts are unchanged through v0.20.5. Reference docs:
 
 - https://hermes-agent.nousresearch.com/docs/developer-guide/adding-platform-adapters
 - https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins
