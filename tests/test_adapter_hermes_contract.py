@@ -26,12 +26,21 @@ class _FakeBasePlatformAdapter:
         self.config = config
         self.platform = platform
         self.connected = False
+        self.fatal_errors = []
+        self.fatal_notifications = 0
 
     def _mark_connected(self):
         self.connected = True
 
     def _mark_disconnected(self):
         self.connected = False
+
+    def _set_fatal_error(self, code, message, *, retryable):
+        self.connected = False
+        self.fatal_errors.append((code, message, retryable))
+
+    async def _notify_fatal_error(self):
+        self.fatal_notifications += 1
 
     def build_source(self, **kwargs):
         return kwargs
@@ -100,18 +109,27 @@ def adapter_module(monkeypatch, tmp_path):
 class _StubClient:
     """Stands in for OpenClawCityClient: never dials the network."""
 
+    instances = []
+
     def __init__(self, cfg, **callbacks):
         self.cfg = cfg
+        self.callbacks = callbacks
         self.started = False
+        self.stopped = False
+        self.stop_calls = 0
+        _StubClient.instances.append(self)
 
     def start(self):
         self.started = True
 
     async def stop(self):
         self.started = False
+        self.stopped = True
+        self.stop_calls += 1
 
 
 def _make_adapter(adapter_module, monkeypatch):
+    _StubClient.instances = []
     monkeypatch.setattr(adapter_module, "OpenClawCityClient", _StubClient)
     return adapter_module.OpenClawCityPlatformAdapter(_FakePlatformConfig())
 
@@ -130,3 +148,96 @@ def test_connect_still_works_without_keyword(adapter_module, monkeypatch):
 def test_connect_tolerates_unknown_future_kwargs(adapter_module, monkeypatch):
     adapter = _make_adapter(adapter_module, monkeypatch)
     assert asyncio.run(adapter.connect(is_reconnect=False, some_future_flag=1)) is True
+
+
+def test_reconnect_stops_the_previous_client(adapter_module, monkeypatch):
+    """A second connect() must stop the first client — two live sockets with
+    one botId make the gateway bump the older one (close 4000) forever."""
+    adapter = _make_adapter(adapter_module, monkeypatch)
+
+    async def scenario():
+        await adapter.connect()
+        first = _StubClient.instances[-1]
+        await adapter.connect(is_reconnect=True)
+        return first
+
+    first = asyncio.run(scenario())
+    assert first.stop_calls == 1
+    assert len(_StubClient.instances) == 2
+    assert adapter._client is _StubClient.instances[-1]
+    assert adapter._client.started
+
+
+def test_send_fails_honestly_when_client_stopped(adapter_module, monkeypatch):
+    adapter = _make_adapter(adapter_module, monkeypatch)
+
+    async def scenario():
+        await adapter.connect()
+        adapter._client.stopped = True  # permanent stop (auth / replaced)
+        return await adapter.send("owner", "hello")
+
+    result = asyncio.run(scenario())
+    assert result.success is False
+    assert result.error
+
+
+def test_permanent_auth_stop_reports_retryable_fatal(adapter_module, monkeypatch):
+    adapter = _make_adapter(adapter_module, monkeypatch)
+
+    async def scenario():
+        await adapter.connect()
+        await adapter._client.callbacks["on_permanent_stop"]("auth_failed")
+
+    asyncio.run(scenario())
+    assert adapter.fatal_errors, "permanent stop must reach _set_fatal_error"
+    code, _message, retryable = adapter.fatal_errors[-1]
+    assert code == "auth_failed"
+    assert retryable is True
+    assert adapter.fatal_notifications == 1
+    assert adapter.connected is False
+
+
+def test_connection_replaced_reports_non_retryable_fatal(adapter_module, monkeypatch):
+    adapter = _make_adapter(adapter_module, monkeypatch)
+
+    async def scenario():
+        await adapter.connect()
+        await adapter._client.callbacks["on_permanent_stop"]("connection_replaced")
+
+    asyncio.run(scenario())
+    code, message, retryable = adapter.fatal_errors[-1]
+    assert code == "connection_replaced"
+    assert retryable is False
+    assert "4000" in message
+
+
+def test_report_fatal_degrades_without_fatal_plumbing(adapter_module, monkeypatch):
+    """Older Hermes builds without _set_fatal_error still get a truthful
+    disconnected flag instead of an AttributeError."""
+    adapter = _make_adapter(adapter_module, monkeypatch)
+
+    async def scenario():
+        await adapter.connect()
+        monkeypatch.delattr(_FakeBasePlatformAdapter, "_set_fatal_error")
+        await adapter._client.callbacks["on_permanent_stop"]("auth_failed")
+
+    asyncio.run(scenario())
+    assert adapter.connected is False
+    assert adapter.fatal_errors == []
+
+
+def test_state_changes_track_runtime_status(adapter_module, monkeypatch):
+    adapter = _make_adapter(adapter_module, monkeypatch)
+    frames = adapter_module  # module exposes ConnectionState via occ_core import
+
+    async def scenario():
+        await adapter.connect()
+        cb = adapter._client.callbacks["on_state_change"]
+        cb(frames.ConnectionState.DISCONNECTED)
+        disconnected = adapter.connected
+        cb(frames.ConnectionState.CONNECTED)
+        return disconnected
+
+    was_disconnected = asyncio.run(scenario())
+    assert was_disconnected is False
+    assert adapter.connected is True

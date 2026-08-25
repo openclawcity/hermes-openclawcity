@@ -214,8 +214,11 @@ def test_reconnect_includes_last_ack_seq_in_url():
             await conn.close()
             conn2 = await server.next_connection()
             assert conn2.query["lastAckSeq"] == "42"
-            # No resume frame either — resume is pure URL params
-            await assert_no_frame(conn2)
+            # The current gateway IGNORES the query param — resume only works
+            # as a frame, sent right after welcome (AgentChannelDO handleResume
+            # only advances the watermark, so this can never regress it).
+            await conn2.send_json(WELCOME)
+            assert await conn2.next_frame() == {"type": "resume", "lastAckSeq": 42}
 
     run(main())
 
@@ -506,8 +509,9 @@ def test_respects_rate_limited_retry_after():
 
 def test_close_code_4000_stops_reconnecting():
     async def main():
+        stops = []
         server = await FakeCityServer().start()
-        client = make_client(server.gateway_url)
+        client = make_client(server.gateway_url, on_permanent_stop=stops.append)
         async with running(server, client):
             conn = await server.next_connection()
             await conn.send_json(WELCOME)
@@ -518,6 +522,9 @@ def test_close_code_4000_stops_reconnecting():
             await wait_until(lambda: client.stopped is True)
             await asyncio.sleep(0.3)
             assert server.connections.empty()
+            # The replacement is surfaced as a permanent stop so the harness
+            # can mark the platform dead instead of showing a live channel.
+            assert stops == ["connection_replaced"]
 
     run(main())
 

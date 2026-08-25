@@ -169,3 +169,63 @@ def test_registration_failure_surfaces_error(_identity_file):
     ident = ensure_identity(API, ACCOUNT, "taken", None, None, http_post=post)
     assert not ident.ok
     assert "registration failed" in ident.error.lower()
+
+
+# ── 25 Aug 2026 audit round: brand, display_name persistence, claimed-agent recovery ──
+
+
+def test_register_declares_the_openclawcity_brand(_identity_file):
+    """urllib sends no Origin header, so without an explicit brand the server
+    falls back to OpenBotCity branding for the claim URL and emails."""
+    post = FakePost([(200, {"jwt": "j", "bot_id": "b", "slug": "s",
+                            "verification_code": "OBC-1111-2222"})])
+    ensure_identity(API, ACCOUNT, "brandy", None, None, http_post=post)
+    _, body, _ = post.calls[0]
+    assert body["brand"] == "openclawcity"
+
+
+def test_fresh_registration_persists_the_sent_display_name(_identity_file):
+    """The 201 response has no display_name — keep the name we registered
+    under so post-restart recovery paths still know it."""
+    post = FakePost([(200, {"jwt": "j", "bot_id": "b", "slug": "fancy-name",
+                            "verification_code": "OBC-1111-2222"})])
+    ident = ensure_identity(API, ACCOUNT, "Fancy Name", None, None, http_post=post)
+    assert ident.display_name == "Fancy Name"
+    assert load_identity(ACCOUNT)["display_name"] == "Fancy Name"
+
+
+def test_claimed_agent_recovers_via_owner_email(_identity_file):
+    """Once a human claims the agent the verification-code path 403s forever;
+    with OPENBOTCITY_OWNER_EMAIL set the plugin falls back to {slug, email}."""
+    save_identity(ACCOUNT, {
+        "agent_key": "stable-key-0123456789", "display_name": "me", "slug": "me",
+        "verification_code": "OBC-1234-5678",
+    })
+    post = FakePost([
+        (500, None),                                  # re-register: transient failure
+        (403, {"error": "Invalid credentials"}),      # code reconnect: bot is claimed
+        (200, {"jwt": "fresh", "bot_id": "same-bot", "slug": "me"}),  # email reconnect
+    ])
+    ident = ensure_identity(
+        API, ACCOUNT, None, None, None,
+        owner_email="human@example.com", http_post=post,
+    )
+    assert ident.ok
+    assert ident.source == "reconnect"
+    url1, body1, _ = post.calls[1]
+    url2, body2, _ = post.calls[2]
+    assert url1 == url2 == f"{API}/agents/reconnect"
+    assert body1 == {"slug": "me", "verification_code": "OBC-1234-5678"}
+    assert body2 == {"slug": "me", "email": "human@example.com"}
+    assert load_identity(ACCOUNT)["jwt"] == "fresh"
+
+
+def test_recovery_failure_hints_at_owner_email_when_unset(_identity_file):
+    save_identity(ACCOUNT, {
+        "agent_key": "stable-key-0123456789", "display_name": "me", "slug": "me",
+        "verification_code": "OBC-1234-5678",
+    })
+    post = FakePost([(500, None), (403, None)])
+    ident = ensure_identity(API, ACCOUNT, None, None, None, http_post=post)
+    assert not ident.ok
+    assert "OPENBOTCITY_OWNER_EMAIL" in ident.error

@@ -1,7 +1,7 @@
 name: openclawcity
 label: OpenClawCity
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >-
   Live OpenClawCity channel with 24/7 persistence. On enable it registers the
   agent (under OPENBOTCITY_DISPLAY_NAME) and keeps it connected to the city over
@@ -42,4 +42,8 @@ optional_env:
   - name: OPENBOTCITY_CRON_DELIVER
     description: "Default chat for cron delivery: 'owner' posts to the owner inbox, anything else speaks in the zone (default 'owner')"
     prompt: "Cron delivery chat (or empty for 'owner')"
+    password: false
+  - name: OPENBOTCITY_OWNER_EMAIL
+    description: "Owner's city account email — enables identity recovery after the agent is claimed (verification codes stop working then)"
+    prompt: "Owner account email (or empty)"
     password: false

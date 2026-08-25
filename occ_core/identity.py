@@ -43,6 +43,26 @@ HttpPostJson = Callable[[str, Dict[str, Any], Optional[str]], Tuple[int, Optiona
 # emits [A-Za-z0-9_-], so 24 bytes → ~32 chars is always valid.
 _AGENT_KEY_BYTES = 24
 
+# Registration brand: without it the server's brand detection falls back to
+# OpenBotCity (no Origin header on urllib calls), which mis-brands the claim
+# URL and claim emails for agents onboarded through this plugin.
+REGISTER_BRAND = "openclawcity"
+
+
+def _reconnect_credentials(stored: Dict[str, Any], owner_email: Optional[str]) -> list:
+    """Credential bodies to try against POST /agents/reconnect, in order:
+    verification code first (unclaimed agents), then the owner's email
+    (claimed agents — the code path 403s once a human owns the bot)."""
+    slug = stored.get("slug")
+    if not slug:
+        return []
+    attempts = []
+    if stored.get("verification_code"):
+        attempts.append({"slug": slug, "verification_code": stored["verification_code"]})
+    if owner_email:
+        attempts.append({"slug": slug, "email": owner_email})
+    return attempts
+
 
 @dataclass
 class Identity:
@@ -149,12 +169,20 @@ def _default_http_post(
             return err.code, None
 
 
-def _identity_from_register(data: Dict[str, Any], agent_key: str, source: str, first_time: bool) -> Identity:
+def _identity_from_register(
+    data: Dict[str, Any],
+    agent_key: str,
+    source: str,
+    first_time: bool,
+    sent_display_name: Optional[str] = None,
+) -> Identity:
     return Identity(
         jwt=data.get("jwt"),
         bot_id=data.get("bot_id"),
         slug=data.get("slug"),
-        display_name=data.get("display_name"),
+        # The fresh-registration response has no display_name — keep the name
+        # we registered under so recovery paths still know it after a restart.
+        display_name=data.get("display_name") or sent_display_name,
         verification_code=data.get("verification_code"),
         claim_url=data.get("claim_url"),
         agent_key=agent_key,
@@ -173,6 +201,7 @@ def ensure_identity(
     env_jwt: Optional[str],
     env_bot_id: Optional[str],
     *,
+    owner_email: Optional[str] = None,
     http_post: Optional[HttpPostJson] = None,
 ) -> Identity:
     """Resolve a usable (jwt, bot_id) for the channel, registering if needed."""
@@ -206,32 +235,37 @@ def ensure_identity(
         if name:
             status, data = post(
                 f"{api_base}/agents/register",
-                {"display_name": name, "agent_key": stored_key},
+                {"display_name": name, "agent_key": stored_key, "brand": REGISTER_BRAND},
                 None,
             )
             if 200 <= status < 300 and data and data.get("jwt"):
-                ident = _identity_from_register(data, stored_key, "reregister", first_time=False)
+                ident = _identity_from_register(
+                    data, stored_key, "reregister", first_time=False, sent_display_name=name
+                )
                 _persist(account_id, ident)
                 return ident
-        # Last resort: recover via the stored recovery secret.
-        if stored.get("slug") and stored.get("verification_code"):
-            status, data = post(
-                f"{api_base}/agents/reconnect",
-                {"slug": stored["slug"], "verification_code": stored["verification_code"]},
-                None,
-            )
+        # Recover via the stored recovery secret (works while unclaimed) or,
+        # once a human has claimed the agent (codes stop working then), via
+        # the owner's account email.
+        for credentials in _reconnect_credentials(stored, owner_email):
+            status, data = post(f"{api_base}/agents/reconnect", credentials, None)
             if 200 <= status < 300 and data and data.get("jwt"):
                 ident = Identity(
                     jwt=data.get("jwt"),
                     bot_id=data.get("bot_id"),
                     slug=data.get("slug") or stored.get("slug"),
-                    display_name=stored.get("display_name"),
+                    display_name=data.get("display_name") or stored.get("display_name"),
                     agent_key=stored_key,
                     source="reconnect",
                 )
                 _persist(account_id, ident)
                 return ident
-        return Identity(error="stored OpenClawCity identity could not be refreshed; check network / the city API")
+        hint = (
+            "" if owner_email else
+            " If your human has already claimed this agent, set OPENBOTCITY_OWNER_EMAIL "
+            "to their account email — verification codes stop working after a claim."
+        )
+        return Identity(error="stored OpenClawCity identity could not be refreshed; check network / the city API." + hint)
 
     # 4. First run — register fresh under the chosen display name.
     if not display_name:
@@ -241,11 +275,13 @@ def ensure_identity(
     agent_key = generate_agent_key()
     status, data = post(
         f"{api_base}/agents/register",
-        {"display_name": display_name, "agent_key": agent_key},
+        {"display_name": display_name, "agent_key": agent_key, "brand": REGISTER_BRAND},
         None,
     )
     if 200 <= status < 300 and data and data.get("jwt"):
-        ident = _identity_from_register(data, agent_key, "register", first_time=True)
+        ident = _identity_from_register(
+            data, agent_key, "register", first_time=True, sent_display_name=display_name
+        )
         _persist(account_id, ident)
         return ident
     return Identity(error=f"OpenClawCity registration failed ({status}): {data}")
