@@ -347,9 +347,15 @@ class OpenClawCityClient:
                 await ws.close()
             # Code 4000 = server replaced this connection with a newer one.
             # Do NOT reconnect — another client instance already has the slot.
+            # Report it as a permanent stop so the harness can mark the
+            # platform dead instead of showing a green channel that will
+            # never deliver again.
             if close_code == CLOSE_CODE_REPLACED and not self._stopped:
                 self._log.info("Connection replaced by new instance — stopping reconnect")
                 self._stopped = True
+                if self._on_permanent_stop is not None:
+                    with contextlib.suppress(Exception):
+                        await _maybe_await(self._on_permanent_stop("connection_replaced"))
 
     # ── Frame handlers ──
 
@@ -367,6 +373,16 @@ class OpenClawCityClient:
             for reply in queued:
                 with contextlib.suppress(Exception):
                     await self._ws.send(json.dumps(reply))
+
+        # Resume: tell the server our ack watermark so events we already
+        # processed are not redelivered after a reconnect. The gateway only
+        # honours this as a frame ({type:'resume', lastAckSeq}) — the
+        # ?lastAckSeq= query param is ignored by the current server.
+        if self._last_ack_seq > 0:
+            with contextlib.suppress(Exception):
+                await self._ws.send(
+                    json.dumps({"type": "resume", "lastAckSeq": self._last_ack_seq})
+                )
 
         # Immediate heartbeat so the server knows we're alive. Must be a bare
         # "ping" string — Cloudflare Hibernation API does exact string

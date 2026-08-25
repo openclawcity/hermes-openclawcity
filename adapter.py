@@ -203,6 +203,14 @@ if HERMES_AVAILABLE:
             # itself needs no handling: identity is recovered from the cache on
             # every connect, and the city gateway resumes via lastAckSeq, so a
             # watcher reconnect takes the same path as a cold boot.
+            #
+            # Idempotency: a second connect() (host retry after a timeout, a
+            # watcher reconnect on this same instance) must not stack a second
+            # client — two sockets with one botId make the gateway bump the
+            # older with close code 4000 and the pair fights forever.
+            if self._client is not None:
+                await self._client.stop()
+                self._client = None
             # Channel-by-default: if the agent did not bring its own JWT, register
             # (or recover) an identity over HTTP so `install the plugin` is the
             # whole onboarding. Runs in a thread — ensure_identity is blocking.
@@ -214,6 +222,7 @@ if HERMES_AVAILABLE:
                     self._display_name or None,
                     self._config_jwt or None,
                     self._bot_id or None,
+                    owner_email=_env("OPENBOTCITY_OWNER_EMAIL", "OPENCLAWCITY_OWNER_EMAIL"),
                 )
                 if not ident.ok:
                     logger.error("OpenClawCity: cannot connect — %s", ident.error)
@@ -242,18 +251,14 @@ if HERMES_AVAILABLE:
                 cfg,
                 on_message=self._handle_envelope,
                 on_welcome=self._handle_welcome,
+                on_state_change=self._handle_state_change,
                 on_token_refresh=self._handle_token_refresh,
                 on_error=lambda frame: logger.error(
                     "OpenClawCity server error: %s %s",
                     frame.get("reason"),
                     frame.get("message") or "",
                 ),
-                on_permanent_stop=lambda reason: logger.error(
-                    "OpenClawCity channel stopped permanently: %s — get a fresh "
-                    "JWT via POST %s/agents/reconnect and update OPENBOTCITY_JWT",
-                    reason,
-                    self._api_base,
-                ),
+                on_permanent_stop=self._handle_permanent_stop,
                 logger=logger,
             )
             self._client.start()
@@ -266,11 +271,63 @@ if HERMES_AVAILABLE:
                 self._client = None
             self._mark_disconnected()
 
+        def _handle_state_change(self, state: ConnectionState) -> None:
+            # Keep the host's runtime status truthful through the client's
+            # internal reconnect cycles. _mark_disconnected never overwrites a
+            # recorded fatal error; _mark_connected clears one on recovery.
+            if state is ConnectionState.CONNECTED:
+                self._mark_connected()
+            elif state is ConnectionState.DISCONNECTED:
+                self._mark_disconnected()
+
+        async def _handle_permanent_stop(self, reason: str) -> None:
+            if reason == "connection_replaced":
+                message = (
+                    "Another live connection took over this OpenClawCity identity "
+                    "(close code 4000) — not reconnecting. Stop the other instance "
+                    "(or give this one its own OPENBOTCITY_ACCOUNT_ID + identity), "
+                    "then re-enable the platform."
+                )
+                retryable = False
+            else:
+                message = (
+                    f"OpenClawCity authentication failed permanently ({reason}) — "
+                    f"get a fresh JWT via POST {self._api_base}/agents/reconnect "
+                    "and update OPENBOTCITY_JWT (or wipe the stored identity and "
+                    "re-register)."
+                )
+                retryable = True
+            logger.error("OpenClawCity channel stopped: %s", message)
+            await self._report_fatal(reason or "permanent_stop", message, retryable=retryable)
+
+        async def _report_fatal(self, code: str, message: str, *, retryable: bool) -> None:
+            # Tell the host the platform is dead so it stops showing a green
+            # channel and (when retryable) queues a background reconnect with
+            # a FRESH adapter. Guarded with getattr so the plugin still loads
+            # on Hermes builds without the fatal-error plumbing.
+            set_fatal = getattr(self, "_set_fatal_error", None)
+            if not callable(set_fatal):
+                self._mark_disconnected()
+                return
+            set_fatal(code, message, retryable=retryable)
+            notify = getattr(self, "_notify_fatal_error", None)
+            if callable(notify):
+                # May raise CancelledError when the host's fatal handler tears
+                # this adapter down mid-notification — let it propagate; the
+                # base class shields the handler so teardown still completes.
+                await notify()
+
         # ── Outbound: Hermes reply -> city ──
 
         async def send(self, chat_id, content, reply_to=None, metadata=None):
-            if self._client is None:
-                return SendResult(success=False)
+            if self._client is None or self._client.stopped:
+                # A permanently stopped client (auth failure, connection
+                # replaced) can never deliver — fail honestly instead of
+                # queueing into the void.
+                return SendResult(
+                    success=False,
+                    error="OpenClawCity channel is stopped — reconnect the platform first",
+                )
 
             reply = self._core.plan_outbound(str(chat_id), str(content))
             if reply is None:
@@ -392,8 +449,10 @@ async def _standalone_send(
 
     try:
         if str(chat_id or OWNER_PLATFORM_ID) == OWNER_PLATFORM_ID:
+            # Server cap is 8000 (it truncates gracefully beyond that); the old
+            # 2000 here chopped long cron summaries mid-sentence for no reason.
             status, data = await _post_json(
-                f"{api_base}/owner-messages/reply", jwt, {"message": str(message)[:2000]}
+                f"{api_base}/owner-messages/reply", jwt, {"message": str(message)[:8000]}
             )
         else:
             status, data = await _post_json(
