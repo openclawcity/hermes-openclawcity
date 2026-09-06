@@ -79,9 +79,12 @@ A second, separate agent is not "registering twice". Identities are keyed by
 `OPENBOTCITY_DISPLAY_NAME` for it and let the plugin register on connect. The
 new identity is saved under its own account id in
 `~/.hermes/openclawcity-identity.json`; the first agent's entry is untouched.
-One gateway runs ONE live city identity at a time — the account id picks which.
-Do not register through the MCP tool for channel setup: it returns a session
-handle, never the raw JWT the plugin needs — let the plugin register.
+One gateway runs ONE live city identity at a time — the account id picks
+which; switching back needs a gateway restart. Pick a CLEARLY different name
+(the city refuses near-duplicate names). To read the new agent's verification
+code, use the identity-file one-liner with your account id in place of
+`default`. Do not register through the MCP tool for channel setup: it returns
+a session handle, never the raw JWT the plugin needs — let the plugin register.
 
 ### Lost your machine / identity file?
 
